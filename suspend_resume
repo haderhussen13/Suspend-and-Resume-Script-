@@ -1,0 +1,454 @@
+#!/bin/bash
+
+##############################
+#
+# Description: Suspend and Resume for Inbound/Outbound in SOHO & Enterprise Servers
+# Date: 01/13/2023
+# Maintainers: Hadeer Hussein
+# Last Update: 06/11/2025
+#
+##############################
+
+#=============================================================================
+# GLOBAL HELPERS
+#=============================================================================
+
+DATE=$(date "+[%Y-%m-%d %k:%M:%S]")
+
+log() {
+    echo "$DATE:${var4}:$*" >> /var/log/suspendandresume.log
+}
+
+die() {
+    local msg="$1"
+    local code="$2"
+    echo "$msg"
+    log "$msg: exit $code"
+    exit "$code"
+}
+
+set_flag() {
+    local flag="$1" val="$2"
+    grep -q "^${flag}=" /home/asterisk/.bash_profile \
+        && sed -i "s/^${flag}=.*/${flag}=${val}/" /home/asterisk/.bash_profile \
+        || echo "${flag}=${val}"                  >> /home/asterisk/.bash_profile
+    source /home/asterisk/.bash_profile
+}
+
+flag_is() {
+    grep -q "^${1}=${2}$" /home/asterisk/.bash_profile
+}
+
+db() {
+    mysql -D asterisk -u "$DBuser" --password="$DBPass" "$@"
+}
+
+db_sn() {
+    db -sN -e "$1"
+}
+
+reload_asterisk() {
+    echo "reload needed"
+}
+
+#=============================================================================
+# HELP
+#=============================================================================
+
+show_help() {
+    cat <<EOF
+
+================================================================================
+  Suspend & Resume Script — Help
+================================================================================
+DESCRIPTION:
+    This script suspends or resumes inbound and outbound calls for
+    Enterprise or SOHO servers managed by FreePBX/Asterisk.
+
+    - suspend : requires a direction (inbound or outbound) to target one side.
+    - resume  : always restores BOTH inbound and outbound together
+                (no direction needed).
+
+--------------------------------------------------------------------------------
+USAGE:
+
+  Enterprise — suspend:
+    $0  Enterprise  suspend  <inbound|outbound>
+
+  Enterprise — resume:
+    $0  Enterprise  resume
+
+  SOHO — suspend:
+    $0  SOHO  suspend  <inbound|outbound>  <company_prefix>
+
+  SOHO — resume:
+    $0  SOHO  resume  <company_prefix>
+
+  \$1 — server_type    : Enterprise | SOHO
+  \$2 — operation      : suspend    | resume
+  \$3 — direction      : inbound    | outbound   (suspend only — not needed for resume)
+  \$4 — company_prefix : TST, ABC, etc.          (SOHO only  — not needed for Enterprise)
+
+  For SOHO resume, company_prefix moves to \$3:
+  \$1 — server_type    : SOHO
+  \$2 — operation      : resume
+  \$3 — company_prefix : TST, ABC, etc.
+
+--------------------------------------------------------------------------------
+EXAMPLES:
+
+  Enterprise — suspend outbound:
+    $0 Enterprise suspend outbound
+
+  Enterprise — suspend inbound:
+    $0 Enterprise suspend inbound
+
+  Enterprise — resume (restores both inbound + outbound):
+    $0 Enterprise resume
+
+  SOHO — suspend outbound for prefix TST:
+    $0 SOHO suspend outbound TST
+
+  SOHO — suspend inbound for prefix TST:
+    $0 SOHO suspend inbound TST
+
+  SOHO — resume (restores both inbound + outbound) for prefix TST:
+    $0 SOHO resume TST
+
+--------------------------------------------------------------------------------
+EXIT CODES:
+    0   Success
+    1   Missing server type
+    2   Missing or invalid operation
+    3   Missing or invalid direction (suspend only)
+    4   Missing company prefix (SOHO only)
+    6   Invalid server type
+    7   Invalid prefix / no SIP peers or inbound routes found
+    8   Outbound already in requested state
+    9   Inbound already in requested state
+
+--------------------------------------------------------------------------------
+LOGS:
+    All operations are logged to: /var/log/suspendandresume.log
+
+================================================================================
+EOF
+    exit 0
+}
+
+#=============================================================================
+# INPUT VALIDATION
+#=============================================================================
+
+validate_inputs() {
+    [[ -z "$servertype"    ]] && die "Error: Please enter the server type, EX: SOHO/Enterprise"   1
+    [[ -z "$suspen_resume" ]] && die "Error: Please enter the operation type, EX: suspend/resume" 2
+
+    [[ "$suspen_resume" != "suspend" && "$suspen_resume" != "resume" ]] \
+                               && die "Error: Invalid operation. Use: suspend/resume"              2
+
+    # direction only required for suspend
+    if [[ "$suspen_resume" == "suspend" ]]; then
+        [[ -z "$type" ]] \
+            && die "Error: Please enter the direction, EX: inbound/outbound"                      3
+        [[ "$type" != "inbound" && "$type" != "outbound" ]] \
+            && die "Error: Invalid direction. Use: inbound/outbound"                              3
+    fi
+
+    # prefix required for SOHO in both operations
+    if [[ "$servertype" == "SOHO" ]]; then
+        [[ -z "$company_prefix" ]] \
+            && die "Error: Please enter the company prefix, EX: TST"                              4
+    fi
+}
+
+#=============================================================================
+# DB CREDENTIALS
+#=============================================================================
+
+load_db_credentials() {
+    DBuser=$(grep "AMPDBUSER" /etc/freepbx.conf | cut -d "=" -f2 | tr -d '"; ')
+    DBPass=$(grep "AMPDBPASS" /etc/freepbx.conf | cut -d "=" -f2 | tr -d '"; ' | tr -d "'")
+
+    local asterisk_version
+    asterisk_version=$(asterisk -V | cut -d "." -f1 | cut -d " " -f2)
+
+    if [[ "$asterisk_version" -eq 11 || "$asterisk_version" -eq 13 ]]; then
+        DBuser=$(grep "AMPDBUSER" /etc/freepbx.conf | cut -d "=" -f2 | tr -d '"; ' | cut -d "'" -f2)
+        DBPass=$(grep "AMPDBPASS" /etc/freepbx.conf | cut -d "=" -f2 | tr -d '"; ' | tr -d "'")
+    fi
+}
+
+#=============================================================================
+# ENTERPRISE FUNCTION
+#=============================================================================
+
+Enterprise() {
+    local action="$1"
+    local direction="$2"
+
+    #-------------------------------------------------------------------------
+    # SUSPEND
+    #-------------------------------------------------------------------------
+    if [[ "$action" == "suspend" ]]; then
+
+        if [[ "$direction" == "outbound" ]]; then
+            flag_is isSuspendedOut True \
+                && die "The outbound was already suspended: exit 8" 8
+
+            db -e "UPDATE sip SET data='blocked'
+                   WHERE keyword='context'
+                   AND id NOT LIKE 'tr-peer%';"
+            reload_asterisk
+            set_flag isSuspendedOut True
+            log "Info: Enterprise outbound suspended successfully"
+            exit 0
+        fi
+
+        if [[ "$direction" == "inbound" ]]; then
+            flag_is isSuspendedIn True \
+                && die "The inbound was already suspended: exit 9" 9
+
+            while IFS= read -r ext; do
+                db -e "UPDATE incoming SET cidnum='8009309912' WHERE extension='$ext';"
+            done < <(db_sn "SELECT extension FROM incoming;")
+
+            reload_asterisk
+            set_flag isSuspendedIn True
+            log "Info: Enterprise inbound suspended successfully"
+            exit 0
+        fi
+
+    fi
+
+    #-------------------------------------------------------------------------
+    # RESUME  —  always resumes BOTH inbound + outbound together
+    #-------------------------------------------------------------------------
+     if [[ "$action" == "resume" ]]; then
+
+    local already_in=false already_out=false
+    local need_reload=false
+
+    flag_is isSuspendedIn  False && already_in=true
+    flag_is isSuspendedOut False && already_out=true
+
+    $already_in && $already_out \
+        && die "Both inbound and outbound were already resumed: exit 8" 8
+
+    # resume inbound
+    if ! $already_in; then
+        while IFS= read -r ext; do
+            db -e "UPDATE incoming
+                   SET cidnum=''
+                   WHERE extension='$ext';"
+        done < <(db_sn "SELECT extension FROM incoming;")
+
+        set_flag isSuspendedIn False
+        need_reload=true
+
+        log "Info: Enterprise inbound resumed successfully"
+    else
+        echo "Info: inbound was already resumed — skipped"
+        log  "Info: inbound was already resumed — skipped"
+    fi
+
+    # resume outbound
+    if ! $already_out; then
+        db -e "UPDATE sip
+               SET data='from-internal'
+               WHERE keyword='context'
+                 AND id NOT LIKE 'tr-peer%';"
+
+        set_flag isSuspendedOut False
+        need_reload=true
+
+        log "Info: Enterprise outbound resumed successfully"
+    else
+        echo "Info: outbound was already resumed — skipped"
+        log  "Info: outbound was already resumed — skipped"
+    fi
+
+    # Reload only once if something changed
+    $need_reload && reload_asterisk
+
+    log "Info: Enterprise resume completed"
+    exit 0
+fi
+}
+
+#=============================================================================
+# SOHO FUNCTION
+#=============================================================================
+
+SOHO() {
+    local prefix="$1"
+    local action="$2"
+    local direction="$3"
+
+    #-------------------------------------------------------------------------
+    # shared helper — get SIP peer IDs by callerid prefix (exclude tr-peer)
+    #-------------------------------------------------------------------------
+     get_sip_ids() {
+         db_sn "
+             SELECT extension
+             FROM users
+             WHERE name LIKE '${prefix}-%'
+                OR name LIKE '${prefix}\_%' ESCAPE '\\\\';
+          "
+    }
+    #-------------------------------------------------------------------------
+    # shared helper — get inbound extensions by description prefix
+    #-------------------------------------------------------------------------
+     get_inbound_exts() {
+         db_sn "SELECT extension
+                FROM incoming
+                WHERE description LIKE '${prefix}-%'
+                OR description LIKE '${prefix}\_%' ESCAPE '\\\\';"
+    }
+    #-------------------------------------------------------------------------
+    # SUSPEND
+    #-------------------------------------------------------------------------
+    if [[ "$action" == "suspend" ]]; then
+
+        if [[ "$direction" == "outbound" ]]; then
+            flag_is "isSuspendedOut_${prefix}" True \
+                && die "The outbound for prefix $prefix was already suspended: exit 8" 8
+
+            local sip_ids
+            sip_ids=$(get_sip_ids)
+            [[ -z "$sip_ids" ]] \
+                && die "Error: No SIP peers found for prefix $prefix: exit 7" 7
+
+            while IFS= read -r sip_id; do
+                db -e "UPDATE sip SET data='blocked'
+                       WHERE id='$sip_id'
+                       AND keyword='context'
+                       AND id NOT LIKE 'tr-peer%';"
+            done <<< "$sip_ids"
+
+            reload_asterisk
+            set_flag "isSuspendedOut_${prefix}" True
+            log "Info: SOHO outbound for prefix $prefix suspended successfully"
+            exit 0
+        fi
+
+        if [[ "$direction" == "inbound" ]]; then
+            flag_is "isSuspendedIn_${prefix}" True \
+                && die "The inbound for prefix $prefix was already suspended: exit 9" 9
+
+            local inbound_exts
+            inbound_exts=$(get_inbound_exts)
+            [[ -z "$inbound_exts" ]] \
+                && die "Error: This Prefix $prefix is not a Valid Prefix: exit 7" 7
+
+            while IFS= read -r ext; do
+                db -e "UPDATE incoming SET cidnum='8009309912' WHERE extension='$ext';"
+            done <<< "$inbound_exts"
+
+            reload_asterisk
+            set_flag "isSuspendedIn_${prefix}" True
+            log "Info: SOHO inbound for prefix $prefix suspended successfully"
+            exit 0
+        fi
+
+    fi
+
+    #-------------------------------------------------------------------------
+    # RESUME  —  always resumes BOTH inbound + outbound together
+    #-------------------------------------------------------------------------
+      if [[ "$action" == "resume" ]]; then
+
+    local already_in=false already_out=false
+    local need_reload=false
+
+    flag_is "isSuspendedIn_${prefix}"  False && already_in=true
+    flag_is "isSuspendedOut_${prefix}" False && already_out=true
+
+    $already_in && $already_out \
+        && die "Both inbound and outbound for prefix $prefix were already resumed: exit 8" 8
+
+    # resume inbound
+    if ! $already_in; then
+        local inbound_exts
+        inbound_exts=$(get_inbound_exts)
+        [[ -z "$inbound_exts" ]] \
+            && die "Error: This Prefix $prefix is not a Valid Prefix: exit 7" 7
+
+        while IFS= read -r ext; do
+            db -e "UPDATE incoming SET cidnum='' WHERE extension='$ext';"
+        done <<< "$inbound_exts"
+
+        set_flag "isSuspendedIn_${prefix}" False
+        need_reload=true
+        log "Info: SOHO inbound for prefix $prefix resumed successfully"
+    else
+        echo "Info: inbound for prefix $prefix was already resumed — skipped"
+        log  "Info: inbound for prefix $prefix was already resumed — skipped"
+    fi
+
+    # resume outbound
+    if ! $already_out; then
+        local sip_ids
+        sip_ids=$(get_sip_ids)
+        [[ -z "$sip_ids" ]] \
+            && die "Error: No SIP peers found for prefix $prefix: exit 7" 7
+
+        while IFS= read -r sip_id; do
+            db -e "UPDATE sip
+                   SET data='from-internal'
+                   WHERE id='$sip_id'
+                     AND keyword='context'
+                     AND id NOT LIKE 'tr-peer%';"
+        done <<< "$sip_ids"
+
+        set_flag "isSuspendedOut_${prefix}" False
+        need_reload=true
+        log "Info: SOHO outbound for prefix $prefix resumed successfully"
+    else
+        echo "Info: outbound for prefix $prefix was already resumed — skipped"
+        log  "Info: outbound for prefix $prefix was already resumed — skipped"
+    fi
+
+    # Reload only once if something changed
+    $need_reload && reload_asterisk
+
+    log "Info: SOHO resume for prefix $prefix completed"
+    exit 0
+fi
+}
+#=============================================================================
+# MAIN
+#=============================================================================
+
+[[ "$1" == "--help" || "$1" == "-h" || "$1" == "help" ]] && show_help
+
+servertype=$1
+suspen_resume=$2
+var4=$DATE
+
+# direction only applies to suspend
+# for resume $3 is company_prefix (SOHO) or unused (Enterprise)
+if [[ "$suspen_resume" == "suspend" ]]; then
+    type=$3
+    company_prefix=$4
+else
+    type=""
+    company_prefix=$3
+fi
+
+load_db_credentials
+validate_inputs
+
+log "Info: User Inputs — servertype=$servertype operation=$suspen_resume direction=$type prefix=$company_prefix"
+
+case "$servertype" in
+    Enterprise)
+        Enterprise "$suspen_resume" "$type"
+        ;;
+    SOHO)
+        SOHO "$company_prefix" "$suspen_resume" "$type"
+        ;;
+    *)
+        die "Error: Invalid server type '$servertype'. Use: SOHO/Enterprise" 6
+        ;;
+esac
